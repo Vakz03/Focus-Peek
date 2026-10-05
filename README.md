@@ -59,6 +59,9 @@ The following settings can be configured directly from the Windhawk user interfa
 ## Technical Details
 
 - **Zero Transparency**: Hooks ordinal 113 of `dwmapi.dll` (`DwmActivateLivePreview`) and returns `S_OK`, preventing the DWM compositor from ever triggering the background translucency shader.
-- **No Z-Order Corruption**: Does not apply `HWND_TOPMOST` directly to target application windows, preventing windows from getting trapped behind other layers or breaking system focus hierarchies.
+- **No Z-Order Corruption**: Does not apply `HWND_TOPMOST` directly to target application windows. The overlay is managed on a dedicated UI thread, automatically sinks to `HWND_BOTTOM` on hide, and prevents window trapping.
+- **Foreground WinEvent Hook & Watchdog Timer**: Listens for system foreground changes (`EVENT_SYSTEM_FOREGROUND`) and monitors hover state with a lightweight watchdog timer, immediately dismissing the overlay if another application gains focus (e.g. game scenes, popups) or if the mouse leaves the taskbar.
+- **Borderless & Fullscreen Window Support**: Accurately detects borderless fullscreen windows and matches their rectangular geometry without rounded corner clipping.
 - **UIPI Architecture**: Inter-process communication between Explorer (Medium IL) and elevated system processes (High IL) uses registered messages permitted via process-level filters (`MSGFLT_ADD`).
 - **Zero Input Hooks**: Does not use global low-level mouse hooks (`WH_MOUSE_LL`), ensuring zero CPU overhead, no latency, and complete explorer stability.
+

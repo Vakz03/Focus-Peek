@@ -2,7 +2,7 @@
 // @id              focus-peek
 // @name            Focus Peek (No Transparency)
 // @description     Brings the target window to focus on taskbar thumbnail hover without Aero Peek transparency via DWM Thumbnail Overlay
-// @version         2.4.2
+// @version         2.4.3
 // @author          vak
 // @github          https://github.com/Vakz03/Focus-Peek
 // @include         explorer.exe
@@ -21,8 +21,10 @@ Modifies taskbar hover preview behavior in Windows.
 - Hooks dwmapi.dll (ordinal 113) to completely suppress Aero Peek background fade and transparency.
 - Projects the visual surface of the target window directly onto a dedicated overlay window via DwmRegisterThumbnail.
 - Dedicated UI thread with message pump for the overlay window, isolating thumbnail rendering from Explorer worker threads.
+- Foreground win-event hook and watchdog timer ensure the overlay immediately dismisses if another window gains focus (e.g. game scenes, popups, fullscreens) or if the cursor leaves the taskbar.
+- Fullscreen and borderless window detection ensures proper aspect and rectangular geometry.
 - Universal DWM Composition:
-  - All windows (Spotify, Discord, VS Code, browsers, Notepad, Task Manager, Admin consoles, etc.) are projected by DWM without transparency onto the primary monitor.
+  - All windows (Spotify, Discord, VS Code, browsers, Notepad, Task Manager, Godot, Admin consoles, etc.) are projected by DWM without transparency onto the primary monitor.
   - For elevated processes included in the mod (Task Manager, Windhawk): When activation is confirmed via click, Explorer sends a filtered UIPI message (ChangeWindowMessageFilter) that the elevated process captures in its native message loop (GetMessage/PeekMessage) to relocate itself to the primary monitor with high integrity privileges.
 - Multi-monitor: Projects the live preview onto the primary monitor regardless of which display the window resides on.
 - Activation Confirmation: If the user clicks on the thumbnail or the preview to activate the window, it permanently moves to the primary monitor and receives focus. If the cursor is removed without clicking, the window remains in its original position.
@@ -83,6 +85,26 @@ static bool IsWindowEffectivelyMaximized(HWND hWndTarget) {
     return false;
 }
 
+static bool IsWindowFullscreenOrMaximized(HWND hWndTarget, HMONITOR hMonTarget) {
+    if (IsWindowEffectivelyMaximized(hWndTarget)) return true;
+
+    // Comprobar si la ventana cubre el monitor completo (estilo juego o app sin bordes)
+    MONITORINFO mi = { sizeof(mi) };
+    if (GetMonitorInfoW(hMonTarget, &mi)) {
+        RECT rc = { 0 };
+        if (GetWindowRect(hWndTarget, &rc)) {
+            int monW = mi.rcMonitor.right - mi.rcMonitor.left;
+            int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+            int winW = rc.right - rc.left;
+            int winH = rc.bottom - rc.top;
+            if (winW >= monW && winH >= monH) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static TargetGeometry CalculateTargetGeometry(HWND hWndTarget, SIZE fallbackSize) {
     TargetGeometry geo = { 0 };
     if (!hWndTarget || !IsWindow(hWndTarget)) return geo;
@@ -99,7 +121,7 @@ static TargetGeometry CalculateTargetGeometry(HWND hWndTarget, SIZE fallbackSize
 
     bool bOnSecondary = (hMonTarget != hMonPrimary);
 
-    geo.isMaximized = IsWindowEffectivelyMaximized(hWndTarget);
+    geo.isMaximized = IsWindowFullscreenOrMaximized(hWndTarget, hMonTarget);
 
     if (geo.isMaximized) {
         RECT rcWork = (bOnSecondary && g_settings.moveToPrimaryMonitor) ? rcWorkPrimary : rcWorkTarget;
@@ -269,23 +291,61 @@ typedef HRESULT (WINAPI *pfnDwmActivateLivePreview)(
 
 static pfnDwmActivateLivePreview pOriginalDwmActivateLivePreview = nullptr;
 
-static const WCHAR OVERLAY_CLASS_NAME[]   = L"FocusPeekOverlayClass";
-static const UINT_PTR TIMER_ID_ACTIVATION = 9001;
+static const WCHAR OVERLAY_CLASS_NAME[]        = L"FocusPeekOverlayClass";
+static const UINT_PTR TIMER_ID_ACTIVATION      = 9001;
+static const UINT_PTR TIMER_ID_HOVER_WATCHDOG  = 9002;
 
-static HWND             g_hOverlay                 = nullptr;
-static HTHUMBNAIL       g_hThumbnail               = nullptr;
-static HWND             g_hCurrentTarget           = nullptr;
-static HWND             g_hPendingActivationTarget = nullptr;
-static bool             g_bTargetWasOnSecondary    = false;
-static bool             g_bOriginalPreviewActive   = false;
+static HWND             g_hOverlay                     = nullptr;
+static HTHUMBNAIL       g_hThumbnail                   = nullptr;
+static HWND             g_hCurrentTarget               = nullptr;
+static HWND             g_hPendingActivationTarget     = nullptr;
+static bool             g_bTargetWasOnSecondary        = false;
+static bool             g_bOriginalPreviewActive       = false;
+static bool             g_bOverlayVisible              = false;
+static bool             g_bTargetWasAlreadyForeground  = false;
 
-static HANDLE           g_hOverlayThread           = NULL;
-static DWORD            g_dwOverlayThreadId        = 0;
-static HANDLE           g_hOverlayReadyEvent       = NULL;
+static HANDLE           g_hOverlayThread               = NULL;
+static DWORD            g_dwOverlayThreadId            = 0;
+static HANDLE           g_hOverlayReadyEvent           = NULL;
+static HWINEVENTHOOK    g_hWinEventHook                = NULL;
 static CRITICAL_SECTION g_csOverlay;
 
 static void ActivateAndMoveTargetWindow(HWND hWndTarget);
 static void HidePreviewOverlay();
+
+static void CALLBACK WinEventProc(
+    HWINEVENTHOOK /*hWinEventHook*/,
+    DWORD event,
+    HWND hwnd,
+    LONG idObject,
+    LONG idChild,
+    DWORD /*idEventThread*/,
+    DWORD /*dwmsEventTime*/
+) {
+    if (event == EVENT_SYSTEM_FOREGROUND && idObject == OBJID_WINDOW && idChild == CHILDID_SELF) {
+        if (!hwnd || hwnd == g_hOverlay) {
+            return;
+        }
+
+        EnterCriticalSection(&g_csOverlay);
+        bool bVisible = g_bOverlayVisible;
+        HWND hTarget  = g_hCurrentTarget;
+        LeaveCriticalSection(&g_csOverlay);
+
+        if (bVisible) {
+            HWND hRoot = GetAncestor(hwnd, GA_ROOT);
+            if (hTarget && (hwnd == hTarget || hRoot == hTarget)) {
+                // El usuario activo la ventana objetivo
+                Wh_Log(L"WinEvent: Target window %p gained foreground", hTarget);
+                ActivateAndMoveTargetWindow(hTarget);
+            } else {
+                // Otra ventana tomo el foco (ej. juego de Godot, ventana sin bordes, otra aplicacion)
+                Wh_Log(L"WinEvent: Another window %p gained foreground, hiding overlay", hwnd);
+            }
+            HidePreviewOverlay();
+        }
+    }
+}
 
 static LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
@@ -319,6 +379,47 @@ static LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
                 }
             }
             HidePreviewOverlay();
+            return 0;
+        }
+
+        if (wParam == TIMER_ID_HOVER_WATCHDOG) {
+            EnterCriticalSection(&g_csOverlay);
+            bool bVis = g_bOverlayVisible;
+            HWND hTarget = g_hCurrentTarget;
+            LeaveCriticalSection(&g_csOverlay);
+
+            if (!bVis) {
+                KillTimer(hWnd, TIMER_ID_HOVER_WATCHDOG);
+                return 0;
+            }
+
+            // 1. Verificar si la ventana objetivo sigue existiendo
+            if (!hTarget || !IsWindow(hTarget)) {
+                Wh_Log(L"Watchdog: Target window invalid, hiding overlay");
+                HidePreviewOverlay();
+                return 0;
+            }
+
+            // 2. Comprobar la posicion del raton
+            POINT pt;
+            if (GetCursorPos(&pt)) {
+                HWND hMouseWnd = WindowFromPoint(pt);
+                if (hMouseWnd) {
+                    DWORD dwPid = 0;
+                    GetWindowThreadProcessId(hMouseWnd, &dwPid);
+                    // Si el cursor salio de Explorer (no esta en barra de tareas ni miniatura)
+                    if (dwPid != GetCurrentProcessId()) {
+                        HWND hFg = GetForegroundWindow();
+                        HWND hRootFg = GetAncestor(hFg, GA_ROOT);
+                        if (hFg != hTarget && hRootFg != hTarget) {
+                            Wh_Log(L"Watchdog: Mouse left Explorer area (%p, pid=%lu), hiding overlay", hMouseWnd, dwPid);
+                            HidePreviewOverlay();
+                            return 0;
+                        }
+                    }
+                }
+            }
+            return 0;
         }
         return 0;
     }
@@ -350,6 +451,15 @@ static DWORD WINAPI OverlayThreadProc(LPVOID) {
         NULL, NULL, hInstance, NULL
     );
 
+    g_hWinEventHook = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND,
+        EVENT_SYSTEM_FOREGROUND,
+        NULL,
+        WinEventProc,
+        0, 0,
+        WINEVENT_OUTOFCONTEXT
+    );
+
     if (g_hOverlayReadyEvent) {
         SetEvent(g_hOverlayReadyEvent);
     }
@@ -358,6 +468,11 @@ static DWORD WINAPI OverlayThreadProc(LPVOID) {
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+    }
+
+    if (g_hWinEventHook) {
+        UnhookWinEvent(g_hWinEventHook);
+        g_hWinEventHook = NULL;
     }
 
     EnterCriticalSection(&g_csOverlay);
@@ -377,12 +492,21 @@ static DWORD WINAPI OverlayThreadProc(LPVOID) {
 
 static void HidePreviewOverlay() {
     EnterCriticalSection(&g_csOverlay);
+    g_bOverlayVisible = false;
+    g_hPendingActivationTarget = nullptr;
+    if (g_hOverlay && IsWindow(g_hOverlay)) {
+        KillTimer(g_hOverlay, TIMER_ID_ACTIVATION);
+        KillTimer(g_hOverlay, TIMER_ID_HOVER_WATCHDOG);
+        SetWindowPos(
+            g_hOverlay,
+            HWND_BOTTOM,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW
+        );
+    }
     if (g_hThumbnail) {
         DwmUnregisterThumbnail(g_hThumbnail);
         g_hThumbnail = nullptr;
-    }
-    if (g_hOverlay && IsWindow(g_hOverlay)) {
-        ShowWindow(g_hOverlay, SW_HIDE);
     }
     LeaveCriticalSection(&g_csOverlay);
 }
@@ -510,6 +634,9 @@ static bool ShowPreviewOverlay(HWND hWndTarget) {
         SWP_NOACTIVATE | SWP_SHOWWINDOW
     );
 
+    g_bOverlayVisible = true;
+    SetTimer(g_hOverlay, TIMER_ID_HOVER_WATCHDOG, 100, NULL);
+
     LeaveCriticalSection(&g_csOverlay);
     return true;
 }
@@ -534,9 +661,12 @@ static HRESULT WINAPI Hook_DwmActivateLivePreview(
             return S_OK;
         }
 
-        g_hCurrentTarget = hWndTarget;
+        HWND hCurFg = GetForegroundWindow();
+        HWND hCurRoot = GetAncestor(hCurFg, GA_ROOT);
+        g_bTargetWasAlreadyForeground = (hWndTarget && (hCurFg == hWndTarget || hCurRoot == hWndTarget));
 
-        Wh_Log(L"DwmActivateLivePreview: fActivate=1, hWndTarget=%p", hWndTarget);
+        g_hCurrentTarget = hWndTarget;
+        Wh_Log(L"DwmActivateLivePreview: fActivate=1, hWndTarget=%p (wasAlreadyFg=%d)", hWndTarget, g_bTargetWasAlreadyForeground ? 1 : 0);
 
         GetAsyncKeyState(VK_LBUTTON);
 
@@ -560,6 +690,11 @@ static HRESULT WINAPI Hook_DwmActivateLivePreview(
             if (bClicked) {
                 Wh_Log(L"DwmActivateLivePreview: Immediate click detected for target %p", hTarget);
                 ActivateAndMoveTargetWindow(hTarget);
+                HidePreviewOverlay();
+            } else if (g_bTargetWasAlreadyForeground) {
+                // Si la ventana ya era de primer plano y no se hizo clic, solo fue un hover pasajero.
+                // No forzar reactivacion para no alterar el z-order ni tapar ventanas hijas (ej. juego de Godot).
+                Wh_Log(L"Hover ended for already-foreground window %p without click, hiding overlay", hTarget);
                 HidePreviewOverlay();
             } else {
                 g_hPendingActivationTarget = hTarget;
@@ -612,7 +747,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
 
     if (g_bIsExplorerProcess) {
-        Wh_Log(L"Initializing Focus Peek v2.4.2 in explorer.exe...");
+        Wh_Log(L"Initializing Focus Peek v2.4.3 in explorer.exe...");
 
         InitializeCriticalSection(&g_csOverlay);
         g_hOverlayReadyEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
@@ -646,7 +781,7 @@ BOOL Wh_ModInit() {
             return FALSE;
         }
 
-        Wh_Log(L"Focus Peek v2.4.2 (Explorer) initialized successfully.");
+        Wh_Log(L"Focus Peek v2.4.3 (Explorer) initialized successfully.");
         return TRUE;
     } else {
         WCHAR processPath[MAX_PATH] = { 0 };
@@ -654,7 +789,7 @@ BOOL Wh_ModInit() {
         const WCHAR* pFileName = wcsrchr(processPath, L'\\');
         pFileName = pFileName ? (pFileName + 1) : processPath;
 
-        Wh_Log(L"Initializing Focus Peek v2.4.2 in client process (%s)...", pFileName);
+        Wh_Log(L"Initializing Focus Peek v2.4.3 in client process (%s)...", pFileName);
 
         // Permitir que el mensaje de activacion atraviese el filtro UIPI
         ChangeWindowMessageFilter(g_msgFocusPeekActivate, MSGFLT_ADD);
@@ -671,7 +806,7 @@ BOOL Wh_ModInit() {
             }
         }
 
-        Wh_Log(L"Focus Peek v2.4.2 (Client) initialized successfully.");
+        Wh_Log(L"Focus Peek v2.4.3 (Client) initialized successfully.");
         return TRUE;
     }
 }
