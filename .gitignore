@@ -1,0 +1,14 @@
+# Build artifacts
+*.dll
+*.exe
+*.obj
+*.pdb
+*.exp
+*.lib
+
+# Temporary files and logs
+*.log
+out.txt
+
+# Editor and compiler cache
+.vscode/ipch/

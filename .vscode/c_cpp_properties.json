@@ -1,0 +1,26 @@
+{
+    "configurations": [
+        {
+            "name": "Windhawk x64",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "C:/Program Files/Windhawk/Compiler/include/**"
+            ],
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "_UNICODE",
+                "WINVER=0x0A00",
+                "_WIN32_WINNT=0x0A00",
+                "NTDDI_VERSION=0x0A000008",
+                "WH_MOD",
+                "WH_EDITING"
+            ],
+            "compilerPath": "C:/Program Files/Windhawk/Compiler/bin/clang++.exe",
+            "cStandard": "c17",
+            "cppStandard": "c++23",
+            "intelliSenseMode": "windows-clang-x64"
+        }
+    ],
+    "version": 4
+}
