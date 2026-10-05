@@ -2,7 +2,7 @@
 // @id              focus-peek
 // @name            Focus Peek (No Transparency)
 // @description     Brings the target window to focus on taskbar thumbnail hover without Aero Peek transparency via DWM Thumbnail Overlay
-// @version         2.4.0
+// @version         2.4.2
 // @author          vak
 // @github          https://github.com/Vakz03/Focus-Peek
 // @include         explorer.exe
@@ -20,6 +20,7 @@ Modifies taskbar hover preview behavior in Windows.
 ### Technical Details
 - Hooks dwmapi.dll (ordinal 113) to completely suppress Aero Peek background fade and transparency.
 - Projects the visual surface of the target window directly onto a dedicated overlay window via DwmRegisterThumbnail.
+- Dedicated UI thread with message pump for the overlay window, isolating thumbnail rendering from Explorer worker threads.
 - Universal DWM Composition:
   - All windows (Spotify, Discord, VS Code, browsers, Notepad, Task Manager, Admin consoles, etc.) are projected by DWM without transparency onto the primary monitor.
   - For elevated processes included in the mod (Task Manager, Windhawk): When activation is confirmed via click, Explorer sends a filtered UIPI message (ChangeWindowMessageFilter) that the elevated process captures in its native message loop (GetMessage/PeekMessage) to relocate itself to the primary monitor with high integrity privileges.
@@ -58,6 +59,117 @@ static UINT g_msgFocusPeekActivate = 0;
 
 // Modulo para procesos cliente elevados (taskmgr.exe, windhawk.exe)
 
+struct TargetGeometry {
+    bool isMaximized;
+    int  x;
+    int  y;
+    int  w;
+    int  h;
+};
+
+static bool IsWindowEffectivelyMaximized(HWND hWndTarget) {
+    if (IsZoomed(hWndTarget)) return true;
+
+    WINDOWPLACEMENT wp = { sizeof(wp) };
+    if (GetWindowPlacement(hWndTarget, &wp)) {
+        if (wp.showCmd == SW_SHOWMAXIMIZED || wp.showCmd == SW_MAXIMIZE) {
+            return true;
+        }
+        if ((wp.showCmd == SW_SHOWMINIMIZED || wp.showCmd == SW_MINIMIZE) &&
+            (wp.flags & WPF_RESTORETOMAXIMIZED)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static TargetGeometry CalculateTargetGeometry(HWND hWndTarget, SIZE fallbackSize) {
+    TargetGeometry geo = { 0 };
+    if (!hWndTarget || !IsWindow(hWndTarget)) return geo;
+
+    HMONITOR hMonPrimary = MonitorFromWindow(NULL, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO miPrimary = { sizeof(miPrimary) };
+    GetMonitorInfoW(hMonPrimary, &miPrimary);
+    RECT rcWorkPrimary = miPrimary.rcWork;
+
+    HMONITOR hMonTarget = MonitorFromWindow(hWndTarget, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO miTarget = { sizeof(miTarget) };
+    GetMonitorInfoW(hMonTarget, &miTarget);
+    RECT rcWorkTarget = miTarget.rcWork;
+
+    bool bOnSecondary = (hMonTarget != hMonPrimary);
+
+    geo.isMaximized = IsWindowEffectivelyMaximized(hWndTarget);
+
+    if (geo.isMaximized) {
+        RECT rcWork = (bOnSecondary && g_settings.moveToPrimaryMonitor) ? rcWorkPrimary : rcWorkTarget;
+        geo.x = rcWork.left;
+        geo.y = rcWork.top;
+        geo.w = rcWork.right - rcWork.left;
+        geo.h = rcWork.bottom - rcWork.top;
+        return geo;
+    }
+
+    bool bIconic = IsIconic(hWndTarget) != FALSE;
+    RECT rcTarget = { 0 };
+
+    if (bIconic) {
+        WINDOWPLACEMENT wp = { sizeof(wp) };
+        GetWindowPlacement(hWndTarget, &wp);
+        rcTarget = wp.rcNormalPosition;
+    } else {
+        HRESULT hrDwm = DwmGetWindowAttribute(hWndTarget, DWMWA_EXTENDED_FRAME_BOUNDS, &rcTarget, sizeof(rcTarget));
+        if (FAILED(hrDwm) || (rcTarget.right == 0 && rcTarget.bottom == 0)) {
+            GetWindowRect(hWndTarget, &rcTarget);
+        }
+    }
+
+    int w = rcTarget.right - rcTarget.left;
+    int h = rcTarget.bottom - rcTarget.top;
+
+    if (w <= 0) w = fallbackSize.cx;
+    if (h <= 0) h = fallbackSize.cy;
+    if (w <= 0) w = 800;
+    if (h <= 0) h = 600;
+
+    RECT rcWorkBounds = (bOnSecondary && g_settings.moveToPrimaryMonitor) ? rcWorkPrimary : rcWorkTarget;
+    int maxW = rcWorkBounds.right - rcWorkBounds.left;
+    int maxH = rcWorkBounds.bottom - rcWorkBounds.top;
+    if (w > maxW) w = maxW;
+    if (h > maxH) h = maxH;
+
+    int targetX = 0;
+    int targetY = 0;
+
+    if (bOnSecondary && g_settings.moveToPrimaryMonitor) {
+        int relX = rcTarget.left - rcWorkTarget.left;
+        int relY = rcTarget.top  - rcWorkTarget.top;
+
+        targetX = rcWorkPrimary.left + relX;
+        targetY = rcWorkPrimary.top  + relY;
+    } else {
+        targetX = rcTarget.left;
+        targetY = rcTarget.top;
+    }
+
+    // Centrar en caso de que las coordenadas esten vacias (ej. apps suspendidas o minimizadas sin posicion)
+    if (targetX == 0 && targetY == 0 && bIconic) {
+        targetX = rcWorkBounds.left + (maxW - w) / 2;
+        targetY = rcWorkBounds.top  + (maxH - h) / 2;
+    }
+
+    if (targetX + w > rcWorkBounds.right)  targetX = rcWorkBounds.right - w;
+    if (targetX < rcWorkBounds.left)       targetX = rcWorkBounds.left;
+    if (targetY + h > rcWorkBounds.bottom) targetY = rcWorkBounds.bottom - h;
+    if (targetY < rcWorkBounds.top)        targetY = rcWorkBounds.top;
+
+    geo.x = targetX;
+    geo.y = targetY;
+    geo.w = w;
+    geo.h = h;
+    return geo;
+}
+
 typedef BOOL (WINAPI *pfnGetMessageW)(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax);
 typedef BOOL (WINAPI *pfnPeekMessageW)(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg);
 
@@ -73,75 +185,58 @@ static void MoveSelfToPrimary(HWND hWndTarget) {
     HMONITOR hMonPrimary = MonitorFromWindow(NULL, MONITOR_DEFAULTTOPRIMARY);
     HMONITOR hMonTarget  = MonitorFromWindow(hWndTarget, MONITOR_DEFAULTTONEAREST);
 
-    MONITORINFO miPrimary = { sizeof(miPrimary) };
-    GetMonitorInfoW(hMonPrimary, &miPrimary);
-    RECT rcWorkPrimary = miPrimary.rcWork;
+    TargetGeometry geo = CalculateTargetGeometry(hWndTarget, { 0, 0 });
 
-    WINDOWPLACEMENT wp = { sizeof(wp) };
-    GetWindowPlacement(hWndTarget, &wp);
-    bool bWasMaximized = IsZoomed(hWndTarget) || (IsIconic(hWndTarget) && wp.showCmd == SW_SHOWMAXIMIZED);
-    bool bWasMinimized = IsIconic(hWndTarget) != FALSE;
+    BOOL bTransitionsDisabled = TRUE;
+    DwmSetWindowAttribute(hWndTarget, DWMWA_TRANSITIONS_FORCEDISABLED, &bTransitionsDisabled, sizeof(bTransitionsDisabled));
 
-    if (hMonTarget != hMonPrimary) {
-        if (bWasMaximized) {
-            ShowWindow(hWndTarget, SW_RESTORE);
-            SetWindowPos(
-                hWndTarget, NULL,
-                rcWorkPrimary.left, rcWorkPrimary.top,
-                rcWorkPrimary.right - rcWorkPrimary.left,
-                rcWorkPrimary.bottom - rcWorkPrimary.top,
-                SWP_NOZORDER | SWP_NOACTIVATE
-            );
-            ShowWindow(hWndTarget, SW_MAXIMIZE);
+    if (hMonTarget != hMonPrimary && g_settings.moveToPrimaryMonitor) {
+        if (geo.isMaximized) {
+            WINDOWPLACEMENT wp = { sizeof(wp) };
+            GetWindowPlacement(hWndTarget, &wp);
+            wp.showCmd = SW_SHOWMAXIMIZED;
+            wp.flags |= WPF_RESTORETOMAXIMIZED;
+            wp.rcNormalPosition.left   = geo.x;
+            wp.rcNormalPosition.top    = geo.y;
+            wp.rcNormalPosition.right  = geo.x + geo.w;
+            wp.rcNormalPosition.bottom = geo.y + geo.h;
+            SetWindowPlacement(hWndTarget, &wp);
+            ShowWindow(hWndTarget, SW_SHOWMAXIMIZED);
         } else {
-            MONITORINFO miTarget = { sizeof(miTarget) };
-            GetMonitorInfoW(hMonTarget, &miTarget);
-            RECT rcWorkTarget = miTarget.rcWork;
-
-            RECT rcTarget = { 0 };
-            if (bWasMinimized) {
-                rcTarget = wp.rcNormalPosition;
-            } else {
-                GetWindowRect(hWndTarget, &rcTarget);
-            }
-
-            int relX = rcTarget.left - rcWorkTarget.left;
-            int relY = rcTarget.top  - rcWorkTarget.top;
-            int w = rcTarget.right - rcTarget.left;
-            int h = rcTarget.bottom - rcTarget.top;
-
-            int targetX = rcWorkPrimary.left + relX;
-            int targetY = rcWorkPrimary.top  + relY;
-
-            if (targetX + w > rcWorkPrimary.right)  targetX = rcWorkPrimary.right - w;
-            if (targetX < rcWorkPrimary.left)       targetX = rcWorkPrimary.left;
-            if (targetY + h > rcWorkPrimary.bottom) targetY = rcWorkPrimary.bottom - h;
-            if (targetY < rcWorkPrimary.top)        targetY = rcWorkPrimary.top;
-
-            if (bWasMinimized) {
-                wp.rcNormalPosition.left   = targetX;
-                wp.rcNormalPosition.top    = targetY;
-                wp.rcNormalPosition.right  = targetX + w;
-                wp.rcNormalPosition.bottom = targetY + h;
+            if (IsIconic(hWndTarget)) {
+                WINDOWPLACEMENT wp = { sizeof(wp) };
+                GetWindowPlacement(hWndTarget, &wp);
+                wp.showCmd = SW_SHOWNORMAL;
+                wp.rcNormalPosition.left   = geo.x;
+                wp.rcNormalPosition.top    = geo.y;
+                wp.rcNormalPosition.right  = geo.x + geo.w;
+                wp.rcNormalPosition.bottom = geo.y + geo.h;
                 SetWindowPlacement(hWndTarget, &wp);
                 ShowWindow(hWndTarget, SW_RESTORE);
             } else {
                 SetWindowPos(
                     hWndTarget, NULL,
-                    targetX, targetY, w, h,
+                    geo.x, geo.y, geo.w, geo.h,
                     SWP_NOZORDER | SWP_ASYNCWINDOWPOS
                 );
             }
         }
     } else {
-        if (bWasMinimized) {
-            ShowWindow(hWndTarget, SW_RESTORE);
+        if (IsIconic(hWndTarget)) {
+            if (geo.isMaximized) {
+                ShowWindow(hWndTarget, SW_SHOWMAXIMIZED);
+            } else {
+                ShowWindow(hWndTarget, SW_RESTORE);
+            }
         }
     }
 
     AllowSetForegroundWindow(ASFW_ANY);
     BringWindowToTop(hWndTarget);
     SetForegroundWindow(hWndTarget);
+
+    bTransitionsDisabled = FALSE;
+    DwmSetWindowAttribute(hWndTarget, DWMWA_TRANSITIONS_FORCEDISABLED, &bTransitionsDisabled, sizeof(bTransitionsDisabled));
 }
 
 static BOOL WINAPI Hook_GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
@@ -177,11 +272,17 @@ static pfnDwmActivateLivePreview pOriginalDwmActivateLivePreview = nullptr;
 static const WCHAR OVERLAY_CLASS_NAME[]   = L"FocusPeekOverlayClass";
 static const UINT_PTR TIMER_ID_ACTIVATION = 9001;
 
-static HWND       g_hOverlay                 = nullptr;
-static HTHUMBNAIL g_hThumbnail               = nullptr;
-static HWND       g_hCurrentTarget           = nullptr;
-static HWND       g_hPendingActivationTarget = nullptr;
-static bool       g_bTargetWasOnSecondary    = false;
+static HWND             g_hOverlay                 = nullptr;
+static HTHUMBNAIL       g_hThumbnail               = nullptr;
+static HWND             g_hCurrentTarget           = nullptr;
+static HWND             g_hPendingActivationTarget = nullptr;
+static bool             g_bTargetWasOnSecondary    = false;
+static bool             g_bOriginalPreviewActive   = false;
+
+static HANDLE           g_hOverlayThread           = NULL;
+static DWORD            g_dwOverlayThreadId        = 0;
+static HANDLE           g_hOverlayReadyEvent       = NULL;
+static CRITICAL_SECTION g_csOverlay;
 
 static void ActivateAndMoveTargetWindow(HWND hWndTarget);
 static void HidePreviewOverlay();
@@ -201,17 +302,6 @@ static LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
 
-    case WM_LBUTTONDOWN: {
-        Wh_Log(L"Direct click on overlay for window %p", g_hCurrentTarget);
-        HWND hTarget = g_hCurrentTarget;
-        HidePreviewOverlay();
-
-        if (hTarget && IsWindow(hTarget)) {
-            ActivateAndMoveTargetWindow(hTarget);
-        }
-        return 0;
-    }
-
     case WM_TIMER: {
         if (wParam == TIMER_ID_ACTIVATION) {
             KillTimer(hWnd, TIMER_ID_ACTIVATION);
@@ -228,6 +318,7 @@ static LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
                     Wh_Log(L"Timer: hover discarded without activation (foreground=%p, target=%p)", hFg, hTarget);
                 }
             }
+            HidePreviewOverlay();
         }
         return 0;
     }
@@ -238,11 +329,7 @@ static LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
     return DefWindowProcW(hWnd, uMsg, wParam, lParam);
 }
 
-static bool EnsureOverlayWindowCreated() {
-    if (g_hOverlay && IsWindow(g_hOverlay)) {
-        return true;
-    }
-
+static DWORD WINAPI OverlayThreadProc(LPVOID) {
     HINSTANCE hInstance = GetModuleHandleW(NULL);
 
     WNDCLASSEXW wc = { sizeof(wc) };
@@ -255,7 +342,7 @@ static bool EnsureOverlayWindowCreated() {
     RegisterClassExW(&wc);
 
     g_hOverlay = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
         OVERLAY_CLASS_NAME,
         L"FocusPeekOverlay",
         WS_POPUP,
@@ -263,15 +350,33 @@ static bool EnsureOverlayWindowCreated() {
         NULL, NULL, hInstance, NULL
     );
 
-    if (!g_hOverlay) {
-        Wh_Log(L"Error creating overlay window: %lu", GetLastError());
-        return false;
+    if (g_hOverlayReadyEvent) {
+        SetEvent(g_hOverlayReadyEvent);
     }
 
-    return true;
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    EnterCriticalSection(&g_csOverlay);
+    if (g_hThumbnail) {
+        DwmUnregisterThumbnail(g_hThumbnail);
+        g_hThumbnail = nullptr;
+    }
+    if (g_hOverlay && IsWindow(g_hOverlay)) {
+        DestroyWindow(g_hOverlay);
+        g_hOverlay = nullptr;
+    }
+    UnregisterClassW(OVERLAY_CLASS_NAME, hInstance);
+    LeaveCriticalSection(&g_csOverlay);
+
+    return 0;
 }
 
 static void HidePreviewOverlay() {
+    EnterCriticalSection(&g_csOverlay);
     if (g_hThumbnail) {
         DwmUnregisterThumbnail(g_hThumbnail);
         g_hThumbnail = nullptr;
@@ -279,6 +384,7 @@ static void HidePreviewOverlay() {
     if (g_hOverlay && IsWindow(g_hOverlay)) {
         ShowWindow(g_hOverlay, SW_HIDE);
     }
+    LeaveCriticalSection(&g_csOverlay);
 }
 
 static void ActivateAndMoveTargetWindow(HWND hWndTarget) {
@@ -295,75 +401,58 @@ static void ActivateAndMoveTargetWindow(HWND hWndTarget) {
     HMONITOR hMonTarget  = MonitorFromWindow(hWndTarget, MONITOR_DEFAULTTONEAREST);
     bool bOnSecondary    = (hMonTarget != hMonPrimary);
 
-    MONITORINFO miPrimary = { sizeof(miPrimary) };
-    GetMonitorInfoW(hMonPrimary, &miPrimary);
-    RECT rcWorkPrimary = miPrimary.rcWork;
+    TargetGeometry geo = CalculateTargetGeometry(hWndTarget, { 0, 0 });
 
-    WINDOWPLACEMENT wp = { sizeof(wp) };
-    GetWindowPlacement(hWndTarget, &wp);
-    bool bWasMaximized = IsZoomed(hWndTarget) || (IsIconic(hWndTarget) && wp.showCmd == SW_SHOWMAXIMIZED);
-    bool bWasMinimized = IsIconic(hWndTarget) != FALSE;
+    BOOL bTransitionsDisabled = TRUE;
+    DwmSetWindowAttribute(hWndTarget, DWMWA_TRANSITIONS_FORCEDISABLED, &bTransitionsDisabled, sizeof(bTransitionsDisabled));
 
     if (bOnSecondary && g_settings.moveToPrimaryMonitor) {
-        if (bWasMaximized) {
-            ShowWindow(hWndTarget, SW_RESTORE);
-            SetWindowPos(
-                hWndTarget, NULL,
-                rcWorkPrimary.left, rcWorkPrimary.top,
-                rcWorkPrimary.right - rcWorkPrimary.left,
-                rcWorkPrimary.bottom - rcWorkPrimary.top,
-                SWP_NOZORDER | SWP_NOACTIVATE
-            );
-            ShowWindow(hWndTarget, SW_MAXIMIZE);
+        if (geo.isMaximized) {
+            WINDOWPLACEMENT wp = { sizeof(wp) };
+            GetWindowPlacement(hWndTarget, &wp);
+            wp.showCmd = SW_SHOWMAXIMIZED;
+            wp.flags |= WPF_RESTORETOMAXIMIZED;
+            wp.rcNormalPosition.left   = geo.x;
+            wp.rcNormalPosition.top    = geo.y;
+            wp.rcNormalPosition.right  = geo.x + geo.w;
+            wp.rcNormalPosition.bottom = geo.y + geo.h;
+            SetWindowPlacement(hWndTarget, &wp);
+            ShowWindow(hWndTarget, SW_SHOWMAXIMIZED);
         } else {
-            MONITORINFO miTarget = { sizeof(miTarget) };
-            GetMonitorInfoW(hMonTarget, &miTarget);
-            RECT rcWorkTarget = miTarget.rcWork;
-
-            RECT rcTarget = { 0 };
-            if (bWasMinimized) {
-                rcTarget = wp.rcNormalPosition;
-            } else {
-                GetWindowRect(hWndTarget, &rcTarget);
-            }
-
-            int relX = rcTarget.left - rcWorkTarget.left;
-            int relY = rcTarget.top  - rcWorkTarget.top;
-            int w = rcTarget.right - rcTarget.left;
-            int h = rcTarget.bottom - rcTarget.top;
-
-            int targetX = rcWorkPrimary.left + relX;
-            int targetY = rcWorkPrimary.top  + relY;
-
-            if (targetX + w > rcWorkPrimary.right)  targetX = rcWorkPrimary.right - w;
-            if (targetX < rcWorkPrimary.left)       targetX = rcWorkPrimary.left;
-            if (targetY + h > rcWorkPrimary.bottom) targetY = rcWorkPrimary.bottom - h;
-            if (targetY < rcWorkPrimary.top)        targetY = rcWorkPrimary.top;
-
-            if (bWasMinimized) {
-                wp.rcNormalPosition.left   = targetX;
-                wp.rcNormalPosition.top    = targetY;
-                wp.rcNormalPosition.right  = targetX + w;
-                wp.rcNormalPosition.bottom = targetY + h;
+            if (IsIconic(hWndTarget)) {
+                WINDOWPLACEMENT wp = { sizeof(wp) };
+                GetWindowPlacement(hWndTarget, &wp);
+                wp.showCmd = SW_SHOWNORMAL;
+                wp.rcNormalPosition.left   = geo.x;
+                wp.rcNormalPosition.top    = geo.y;
+                wp.rcNormalPosition.right  = geo.x + geo.w;
+                wp.rcNormalPosition.bottom = geo.y + geo.h;
                 SetWindowPlacement(hWndTarget, &wp);
                 ShowWindow(hWndTarget, SW_RESTORE);
             } else {
                 SetWindowPos(
                     hWndTarget, NULL,
-                    targetX, targetY, w, h,
+                    geo.x, geo.y, geo.w, geo.h,
                     SWP_NOZORDER | SWP_ASYNCWINDOWPOS
                 );
             }
         }
     } else {
-        if (bWasMinimized) {
-            ShowWindow(hWndTarget, SW_RESTORE);
+        if (IsIconic(hWndTarget)) {
+            if (geo.isMaximized) {
+                ShowWindow(hWndTarget, SW_SHOWMAXIMIZED);
+            } else {
+                ShowWindow(hWndTarget, SW_RESTORE);
+            }
         }
     }
 
     AllowSetForegroundWindow(ASFW_ANY);
     BringWindowToTop(hWndTarget);
     SetForegroundWindow(hWndTarget);
+
+    bTransitionsDisabled = FALSE;
+    DwmSetWindowAttribute(hWndTarget, DWMWA_TRANSITIONS_FORCEDISABLED, &bTransitionsDisabled, sizeof(bTransitionsDisabled));
 }
 
 static bool ShowPreviewOverlay(HWND hWndTarget) {
@@ -371,7 +460,10 @@ static bool ShowPreviewOverlay(HWND hWndTarget) {
         return false;
     }
 
-    if (!EnsureOverlayWindowCreated()) {
+    EnterCriticalSection(&g_csOverlay);
+
+    if (!g_hOverlay || !IsWindow(g_hOverlay)) {
+        LeaveCriticalSection(&g_csOverlay);
         return false;
     }
 
@@ -383,6 +475,7 @@ static bool ShowPreviewOverlay(HWND hWndTarget) {
     HRESULT hr = DwmRegisterThumbnail(g_hOverlay, hWndTarget, &g_hThumbnail);
     if (FAILED(hr)) {
         Wh_Log(L"DwmRegisterThumbnail failed: 0x%08X for hWndTarget=%p", (unsigned int)hr, hWndTarget);
+        LeaveCriticalSection(&g_csOverlay);
         return false;
     }
 
@@ -390,91 +483,20 @@ static bool ShowPreviewOverlay(HWND hWndTarget) {
     DwmQueryThumbnailSourceSize(g_hThumbnail, &srcSize);
 
     HMONITOR hMonPrimary = MonitorFromWindow(NULL, MONITOR_DEFAULTTOPRIMARY);
-    MONITORINFO miPrimary = { sizeof(miPrimary) };
-    GetMonitorInfoW(hMonPrimary, &miPrimary);
-    RECT rcWorkPrimary = miPrimary.rcWork;
-
     HMONITOR hMonTarget = MonitorFromWindow(hWndTarget, MONITOR_DEFAULTTONEAREST);
     g_bTargetWasOnSecondary = (hMonTarget != hMonPrimary);
 
-    bool bMaximized = IsZoomed(hWndTarget) != FALSE;
-    bool bIconic    = IsIconic(hWndTarget) != FALSE;
-    WINDOWPLACEMENT wp = { sizeof(wp) };
+    TargetGeometry geo = CalculateTargetGeometry(hWndTarget, srcSize);
 
-    if (bIconic) {
-        GetWindowPlacement(hWndTarget, &wp);
-        if (wp.showCmd == SW_SHOWMAXIMIZED) {
-            bMaximized = true;
-        }
-    }
-
-    int targetX = 0;
-    int targetY = 0;
-    int targetW = 0;
-    int targetH = 0;
-
-    if (bMaximized) {
-        targetX = rcWorkPrimary.left;
-        targetY = rcWorkPrimary.top;
-        targetW = rcWorkPrimary.right - rcWorkPrimary.left;
-        targetH = rcWorkPrimary.bottom - rcWorkPrimary.top;
-    } else {
-        RECT rcTarget = { 0 };
-        if (bIconic) {
-            rcTarget = wp.rcNormalPosition;
-        } else {
-            HRESULT hrDwm = DwmGetWindowAttribute(hWndTarget, DWMWA_EXTENDED_FRAME_BOUNDS, &rcTarget, sizeof(rcTarget));
-            if (FAILED(hrDwm) || (rcTarget.right == 0 && rcTarget.bottom == 0)) {
-                GetWindowRect(hWndTarget, &rcTarget);
-            }
-        }
-
-        int w = rcTarget.right - rcTarget.left;
-        int h = rcTarget.bottom - rcTarget.top;
-
-        if (w <= 0) w = srcSize.cx;
-        if (h <= 0) h = srcSize.cy;
-        if (w <= 0) w = 800;
-        if (h <= 0) h = 600;
-
-        int maxW = rcWorkPrimary.right - rcWorkPrimary.left;
-        int maxH = rcWorkPrimary.bottom - rcWorkPrimary.top;
-        if (w > maxW) w = maxW;
-        if (h > maxH) h = maxH;
-
-        if (g_bTargetWasOnSecondary && g_settings.moveToPrimaryMonitor) {
-            MONITORINFO miTarget = { sizeof(miTarget) };
-            GetMonitorInfoW(hMonTarget, &miTarget);
-            RECT rcWorkTarget = miTarget.rcWork;
-
-            int relX = rcTarget.left - rcWorkTarget.left;
-            int relY = rcTarget.top  - rcWorkTarget.top;
-
-            targetX = rcWorkPrimary.left + relX;
-            targetY = rcWorkPrimary.top  + relY;
-
-            if (targetX + w > rcWorkPrimary.right)  targetX = rcWorkPrimary.right - w;
-            if (targetX < rcWorkPrimary.left)       targetX = rcWorkPrimary.left;
-            if (targetY + h > rcWorkPrimary.bottom) targetY = rcWorkPrimary.bottom - h;
-            if (targetY < rcWorkPrimary.top)        targetY = rcWorkPrimary.top;
-        } else {
-            targetX = rcTarget.left;
-            targetY = rcTarget.top;
-        }
-
-        targetW = w;
-        targetH = h;
-    }
-
-    DWORD cornerPref = bMaximized ? 1 : 2;
+    DWORD cornerPref = geo.isMaximized ? 1 : 2;
     DwmSetWindowAttribute(g_hOverlay, 33, &cornerPref, sizeof(cornerPref));
 
     DWM_THUMBNAIL_PROPERTIES props = { 0 };
     props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE;
     props.rcDestination.left   = 0;
     props.rcDestination.top    = 0;
-    props.rcDestination.right  = targetW;
-    props.rcDestination.bottom = targetH;
+    props.rcDestination.right  = geo.w;
+    props.rcDestination.bottom = geo.h;
     props.opacity              = 255;
     props.fVisible             = TRUE;
     props.fSourceClientAreaOnly = FALSE;
@@ -484,10 +506,11 @@ static bool ShowPreviewOverlay(HWND hWndTarget) {
     SetWindowPos(
         g_hOverlay,
         HWND_TOPMOST,
-        targetX, targetY, targetW, targetH,
+        geo.x, geo.y, geo.w, geo.h,
         SWP_NOACTIVATE | SWP_SHOWWINDOW
     );
 
+    LeaveCriticalSection(&g_csOverlay);
     return true;
 }
 
@@ -503,6 +526,7 @@ static HRESULT WINAPI Hook_DwmActivateLivePreview(
             if (g_settings.blockShowDesktopPeek) {
                 return S_OK;
             }
+            g_bOriginalPreviewActive = true;
             return pOriginalDwmActivateLivePreview(fActivate, hWndTarget, hWndTrigger, dwFlags, prcExclude);
         }
 
@@ -517,17 +541,17 @@ static HRESULT WINAPI Hook_DwmActivateLivePreview(
         GetAsyncKeyState(VK_LBUTTON);
 
         if (!ShowPreviewOverlay(hWndTarget)) {
+            g_bOriginalPreviewActive = true;
             return pOriginalDwmActivateLivePreview(fActivate, hWndTarget, hWndTrigger, dwFlags, prcExclude);
         }
 
+        g_bOriginalPreviewActive = false;
         return S_OK;
     } else {
         Wh_Log(L"DwmActivateLivePreview: fActivate=0");
 
         HWND hTarget = g_hCurrentTarget;
         g_hCurrentTarget = nullptr;
-
-        HidePreviewOverlay();
 
         if (hTarget && IsWindow(hTarget)) {
             SHORT mouseState = GetAsyncKeyState(VK_LBUTTON);
@@ -536,15 +560,21 @@ static HRESULT WINAPI Hook_DwmActivateLivePreview(
             if (bClicked) {
                 Wh_Log(L"DwmActivateLivePreview: Immediate click detected for target %p", hTarget);
                 ActivateAndMoveTargetWindow(hTarget);
+                HidePreviewOverlay();
             } else {
                 g_hPendingActivationTarget = hTarget;
                 if (g_hOverlay && IsWindow(g_hOverlay)) {
-                    SetTimer(g_hOverlay, TIMER_ID_ACTIVATION, 60, NULL);
+                    SetTimer(g_hOverlay, TIMER_ID_ACTIVATION, 50, NULL);
+                } else {
+                    HidePreviewOverlay();
                 }
             }
+        } else {
+            HidePreviewOverlay();
         }
 
-        if (!hWndTarget) {
+        if (g_bOriginalPreviewActive || !hWndTarget) {
+            g_bOriginalPreviewActive = false;
             return pOriginalDwmActivateLivePreview(fActivate, hWndTarget, hWndTrigger, dwFlags, prcExclude);
         }
 
@@ -579,10 +609,17 @@ static bool DetectIfExplorerProcess() {
 BOOL Wh_ModInit() {
     g_msgFocusPeekActivate = RegisterWindowMessageW(L"FocusPeek_Activate");
     g_bIsExplorerProcess   = DetectIfExplorerProcess();
+    LoadSettings();
 
     if (g_bIsExplorerProcess) {
-        Wh_Log(L"Initializing Focus Peek v2.4 in explorer.exe...");
-        LoadSettings();
+        Wh_Log(L"Initializing Focus Peek v2.4.2 in explorer.exe...");
+
+        InitializeCriticalSection(&g_csOverlay);
+        g_hOverlayReadyEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        g_hOverlayThread = CreateThread(NULL, 0, OverlayThreadProc, NULL, 0, &g_dwOverlayThreadId);
+        if (g_hOverlayThread && g_hOverlayReadyEvent) {
+            WaitForSingleObject(g_hOverlayReadyEvent, 2000);
+        }
 
         HMODULE hDwmApi = GetModuleHandleW(L"dwmapi.dll");
         if (!hDwmApi) {
@@ -609,7 +646,7 @@ BOOL Wh_ModInit() {
             return FALSE;
         }
 
-        Wh_Log(L"Focus Peek v2.4 (Explorer) initialized successfully.");
+        Wh_Log(L"Focus Peek v2.4.2 (Explorer) initialized successfully.");
         return TRUE;
     } else {
         WCHAR processPath[MAX_PATH] = { 0 };
@@ -617,7 +654,7 @@ BOOL Wh_ModInit() {
         const WCHAR* pFileName = wcsrchr(processPath, L'\\');
         pFileName = pFileName ? (pFileName + 1) : processPath;
 
-        Wh_Log(L"Initializing Focus Peek v2.4 in client process (%s)...", pFileName);
+        Wh_Log(L"Initializing Focus Peek v2.4.2 in client process (%s)...", pFileName);
 
         // Permitir que el mensaje de activacion atraviese el filtro UIPI
         ChangeWindowMessageFilter(g_msgFocusPeekActivate, MSGFLT_ADD);
@@ -634,7 +671,7 @@ BOOL Wh_ModInit() {
             }
         }
 
-        Wh_Log(L"Focus Peek v2.4 (Client) initialized successfully.");
+        Wh_Log(L"Focus Peek v2.4.2 (Client) initialized successfully.");
         return TRUE;
     }
 }
@@ -642,15 +679,23 @@ BOOL Wh_ModInit() {
 void Wh_ModUninit() {
     if (g_bIsExplorerProcess) {
         Wh_Log(L"Unloading Focus Peek from explorer.exe...");
-        if (g_hOverlay && IsWindow(g_hOverlay)) {
-            KillTimer(g_hOverlay, TIMER_ID_ACTIVATION);
+
+        if (g_dwOverlayThreadId) {
+            PostThreadMessageW(g_dwOverlayThreadId, WM_QUIT, 0, 0);
+            if (g_hOverlayThread) {
+                WaitForSingleObject(g_hOverlayThread, 2000);
+                CloseHandle(g_hOverlayThread);
+                g_hOverlayThread = NULL;
+            }
+            g_dwOverlayThreadId = 0;
         }
-        HidePreviewOverlay();
-        if (g_hOverlay && IsWindow(g_hOverlay)) {
-            DestroyWindow(g_hOverlay);
-            g_hOverlay = nullptr;
+
+        if (g_hOverlayReadyEvent) {
+            CloseHandle(g_hOverlayReadyEvent);
+            g_hOverlayReadyEvent = NULL;
         }
-        UnregisterClassW(OVERLAY_CLASS_NAME, GetModuleHandleW(NULL));
+
+        DeleteCriticalSection(&g_csOverlay);
     } else {
         Wh_Log(L"Unloading Focus Peek from client process...");
     }
